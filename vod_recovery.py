@@ -58,6 +58,7 @@ RESOLUTIONS = ["chunked", "2160p60", "2160p30", "2160p20", "1440p60", "1440p30",
 
 CLI_MODE = False
 CLI_DOWNLOAD_FROM_START = False
+OUTPUT_DIRECTORY_OVERRIDE = None  # set via --output, takes precedence over DEFAULT_DIRECTORY
 CLI_QUALITY = None
 
 if sys.platform == 'win32' and sys.version_info < (3, 12):
@@ -154,7 +155,7 @@ def get_ffmpeg_format(file_extension):
 
 
 def get_default_directory():
-    default_directory = read_config_by_key("settings", "DEFAULT_DIRECTORY")
+    default_directory = OUTPUT_DIRECTORY_OVERRIDE or read_config_by_key("settings", "DEFAULT_DIRECTORY")
 
     if not default_directory:
         default_directory = "~/Downloads/"
@@ -3692,8 +3693,93 @@ def bulk_vod_recovery_channel_cli(streamer_name, quality):
 
 def bulk_vod_recovery_cli(csv_file_path, quality):
     streamer_name = parse_streamer_from_csv_filename(csv_file_path)
-    vods = {timestamp: (video_id, None) for timestamp, video_id in parse_vod_csv_file(csv_file_path).items()}
+    # SullyGnome CSVs carry no titles, so look them up on vodvod by stream id
+    titles = {s["stream_id"]: s["title"] for s in (fetch_vod_vod_streams(streamer_name.lower()) or [])}
+    vods = {timestamp: (video_id, titles.get(video_id)) for timestamp, video_id in parse_vod_csv_file(csv_file_path).items()}
     bulk_vod_download(streamer_name, vods, quality)
+
+
+ARCHIVE_TRANSLITERATION = {"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "AE", "Ö": "OE", "Ü": "UE", "ß": "ss"}
+
+
+def format_archive_title(title):
+    # "2 NÄCHTE BRUDI VS. WILD 🔥 #werbung" -> "2-NAECHTE-BRUDI-VS.-WILD"
+    title = re.sub(r"#\S+", " ", title or "").replace("<3", " ")
+    # ß next to uppercase letters (FLOß) -> SS, otherwise ss
+    title = re.sub(r"(?<=[A-ZÄÖÜ])ß|ß(?=[A-ZÄÖÜ])", "SS", title)
+    for char, replacement in ARCHIVE_TRANSLITERATION.items():
+        title = title.replace(char, replacement)
+    title = normalize("NFKD", title).encode("ascii", "ignore").decode()
+    title = re.sub(r"[^A-Za-z0-9.\-]+", "-", title)
+    title = re.sub(r"-{2,}", "-", title).strip("-.")
+    return title
+
+
+def get_archive_filename(stream_date, title, video_id):
+    # Archive naming scheme: YYYY-MM-DD_TITLE_[stream_id].mp4
+    parts = [format_date(stream_date) or stream_date[:10]]
+    archive_title = format_archive_title(title)
+    if archive_title:
+        parts.append(archive_title)
+    parts.append(f"[{video_id}]")
+    return "_".join(parts) + get_default_video_format()
+
+
+STREAMS_INDEX_HEADER = ["stream_id", "vod_id", "vod_url", "start_utc", "game", "titel_original", "dauer_h", "quelle", "datei"]
+
+
+def append_streams_index(video_id, stream_date, title, filename):
+    # Append a row to _streams.tsv in the download directory (created if missing)
+    index_path = os.path.join(get_default_directory(), "_streams.tsv")
+    if not os.path.isfile(index_path):
+        with open(index_path, "w", encoding="utf-8") as index_file:
+            index_file.write("\t".join(STREAMS_INDEX_HEADER) + "\n")
+    start_utc = stream_date.replace(" ", "T")[:16] + "Z"
+    row = [video_id, "", "", start_utc, "", (title or "").replace("\t", " "), "", "vodvod (vod_recovery)", filename]
+    with open(index_path, "a", encoding="utf-8") as index_file:
+        index_file.write("\t".join(row) + "\n")
+
+
+OLD_VOD_FILENAME_PATTERN = re.compile(r"^(\S+) - (?:\d{4}-\d{2}-\d{2} - )?.*?\[(\d+)\](\.\w+)$")
+
+
+def rename_existing_vods():
+    # Rename files in the default "streamer - date - title - [id].mp4" format to the archive scheme
+    directory = get_default_directory()
+    index_path = os.path.join(directory, "_streams.tsv")
+    indexed_ids = set()
+    if os.path.isfile(index_path):
+        with open(index_path, encoding="utf-8") as index_file:
+            indexed_ids = {line.split("\t", 1)[0] for line in index_file}
+
+    streams_by_streamer = {}
+    renamed, missing = 0, []
+    for filename in sorted(os.listdir(directory)):
+        match = OLD_VOD_FILENAME_PATTERN.match(filename)
+        if not match:
+            continue
+        streamer, video_id, extension = match.groups()
+        if streamer not in streams_by_streamer:
+            streams_by_streamer[streamer] = {s["stream_id"]: s for s in (fetch_vod_vod_streams(streamer.lower()) or [])}
+        stream = streams_by_streamer[streamer].get(video_id)
+        if not stream:
+            missing.append(filename)
+            continue
+        new_filename = get_archive_filename(stream["dt_utc"], stream["title"], video_id)
+        new_filename = os.path.splitext(new_filename)[0] + extension
+        if os.path.exists(os.path.join(directory, new_filename)):
+            print(f"Skipping {filename}, {new_filename} already exists")
+            continue
+        os.rename(os.path.join(directory, filename), os.path.join(directory, new_filename))
+        print(f"{filename}\n  -> {new_filename}")
+        if video_id not in indexed_ids:
+            append_streams_index(video_id, stream["dt_utc"], stream["title"], new_filename)
+            indexed_ids.add(video_id)
+        renamed += 1
+
+    print(f"\nRenamed {renamed} file(s)")
+    if missing:
+        print("No title found on vodvod for:\n  " + "\n  ".join(missing))
 
 
 def bulk_vod_download(streamer_name, vods, quality):
@@ -3712,7 +3798,9 @@ def bulk_vod_download(streamer_name, vods, quality):
             continue
         m3u8_link = find_quality_link(m3u8_link, quality)
         m3u8_source = process_m3u8_configuration(m3u8_link) or m3u8_link
-        if handle_vod_url_normal(m3u8_source, title=title, stream_date=timestamp):
+        archive_filename = get_archive_filename(timestamp, title, video_id)
+        if handle_vod_url_normal(m3u8_source, title=title, stream_date=timestamp, filename=archive_filename):
+            append_streams_index(video_id, timestamp, title, archive_filename)
             downloaded.append(video_id)
         else:
             failed.append(video_id)
@@ -4746,10 +4834,18 @@ def get_VLC_Location():
         return None
 
 
-def handle_vod_url_normal(m3u8_source, title=None, stream_date=None):
+def handle_vod_url_normal(m3u8_source, title=None, stream_date=None, filename=None):
     is_file = os.path.isfile(m3u8_source)
 
-    if is_file:
+    if filename:
+        vod_filename = filename
+        success = download_m3u8_video_file(m3u8_source, vod_filename) if is_file else download_m3u8_video_url(m3u8_source, vod_filename)
+        if not success:
+            print(f"\n\033[91m\u2717 Failed to download Vod: {vod_filename}\033[0m\n")
+            return False
+        if is_file:
+            os.remove(m3u8_source)
+    elif is_file:
         vod_filename = get_filename_for_file_source(m3u8_source, title=title, stream_date=stream_date)
 
         success = download_m3u8_video_file(m3u8_source, vod_filename)
@@ -5974,12 +6070,17 @@ if __name__ == "__main__":
     parser.add_argument("--end", dest="end_time", help="Trim end time HH:MM:SS for VOD download")
     parser.add_argument("--quality", dest="quality", help="Video quality for VOD download (e.g. 1080p60, 720p60, audio_only, source, best). With --csv/--channel a prefix like 720p is allowed (default: 720p)")
     parser.add_argument("--metadata", dest="metadata", action="store_true", help="Print stream metadata as JSON and exit (use with --url or --m3u8)")
+    parser.add_argument("--output", dest="output", help="Download directory for this run (overrides DEFAULT_DIRECTORY)")
+    parser.add_argument("--rename", dest="rename", action="store_true", help="Rename existing 'streamer - date - title - [id]' files in the download directory to the archive scheme")
     parser.add_argument("--watch", dest="watch", action="store_true", help="Open the stream in VLC instead of downloading")
     parser.add_argument("--from-start", dest="from_start", action="store_true", help="Attempt to record live channel from the beginning")
     parser.add_argument("--csv", dest="csv", help="Bulk recover and download all VODs from a SullyGnome CSV export")
     parser.add_argument("--channel", dest="channel", help="Bulk recover and download all recent VODs of a channel (no CSV needed)")
 
     args = parser.parse_args()
+
+    if args.output:
+        OUTPUT_DIRECTORY_OVERRIDE = args.output
 
     if args.quality and not (args.csv or args.channel):
         quality_arg = args.quality.strip().lower()
@@ -5996,19 +6097,23 @@ if __name__ == "__main__":
         print_metadata_cli(args)
         sys.exit(0)
 
-    if any([args.url, args.clip_url, getattr(args, "m3u8", None), args.csv, args.channel]):
+    if any([args.url, args.clip_url, getattr(args, "m3u8", None), args.csv, args.channel, args.rename]):
         try:
             CLI_MODE = True
             if args.channel:
                 bulk_vod_recovery_channel_cli(args.channel, (args.quality or "720p").strip().lower())
+                rename_existing_vods()
             elif args.csv:
                 bulk_vod_recovery_cli(args.csv, (args.quality or "720p").strip().lower())
+                rename_existing_vods()
             elif args.clip_url:
                 handle_twitch_clip(args.clip_url)
             elif getattr(args, "m3u8", None):
                 download_m3u8_cli(args)
             elif args.url:
                 download_url_cli(args)
+            elif args.rename:
+                rename_existing_vods()
         except KeyboardInterrupt:
             print("\n\nExiting...")
             sys.exit(0)

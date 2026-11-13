@@ -64,6 +64,8 @@ python vod_recovery.py --url https://twitchtracker.com/streamer/streams/12345678
 python vod_recovery.py --csv "C:\path\to\streamer_sullygnome_export.csv"
 python vod_recovery.py --csv "C:\path\to\streamer_sullygnome_export.csv" --quality 1080p
 python vod_recovery.py --channel streamer --quality 720p
+python vod_recovery.py --channel streamer --output /mnt/download/twitch/streamer
+python vod_recovery.py --rename --output /mnt/download/twitch/streamer
 ```
 
 - **URL downloads** `--url <link>` supports Twitch, TwitchTracker, Streamscharts, and SullyGnome pages.
@@ -77,6 +79,9 @@ python vod_recovery.py --channel streamer --quality 720p
 - **Bulk download from CSV** `--csv <file>` recovers and downloads every VOD listed in a SullyGnome CSV export, without any interactive prompts. The streamer name is taken from the CSV filename. VODs whose ID already appears in a filename in the download directory are skipped, and a summary of downloaded / skipped / failed VODs is printed at the end.
 - **Bulk download from channel** `--channel <name>` works like `--csv`, but fetches the channel's recent streams automatically (no CSV export needed). A stream that is currently live is skipped.
 - **Bulk quality** With `--csv`/`--channel`, `--quality` defaults to `720p` and also accepts a resolution prefix (e.g. `1080p` tries `1080p60`, `1080p30`, `1080p20`). If the requested quality is not available, the originally found quality is downloaded instead.
+- **Archive naming** Bulk downloads are saved as `YYYY-MM-DD_TITLE_[stream_id].mp4`. Titles are taken from vodvod (also for CSV imports, which carry no titles), hashtags and emojis are dropped, umlauts are transliterated (`ä` → `ae`, `ß` → `ss`) and everything else is reduced to ASCII with `-` as separator. Every successful download appends a row to `_streams.tsv` in the download directory (created with a header if missing).
+- **Output directory** `--output <dir>` overrides `DEFAULT_DIRECTORY` for this run only.
+- **Rename existing files** `--rename` renames files in the default `streamer - date - title - [id]` format in the download directory to the archive scheme and adds missing entries to `_streams.tsv`. It runs automatically after `--csv`/`--channel`. Files whose stream is not listed on vodvod are left untouched and reported.
 
 ## Notes
 
