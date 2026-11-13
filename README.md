@@ -61,6 +61,9 @@ python vod_recovery.py --m3u8 "https://example.com/index-dvr.m3u8" --watch
 python vod_recovery.py --url https://twitchtracker.com/streamer/streams/1234567890 --quality 1080p60
 python vod_recovery.py --m3u8 "https://example.com/index-dvr.m3u8" --quality best
 python vod_recovery.py --url https://twitchtracker.com/streamer/streams/1234567890 --metadata
+python vod_recovery.py --csv "C:\path\to\streamer_sullygnome_export.csv"
+python vod_recovery.py --csv "C:\path\to\streamer_sullygnome_export.csv" --quality 1080p
+python vod_recovery.py --channel streamer --quality 720p
 ```
 
 - **URL downloads** `--url <link>` supports Twitch, TwitchTracker, Streamscharts, and SullyGnome pages.
@@ -71,6 +74,9 @@ python vod_recovery.py --url https://twitchtracker.com/streamer/streams/12345678
 - **Direct M3U8** Use `--m3u8 <m3u8_url>` to download, trim, or watch directly from an M3U8 URL.
 - **Quality** `--quality <name>` skips the interactive quality prompt. Accepts `chunked`, `2160p60`, `1080p60`, `720p60`, `720p30`, `480p30`, `360p30`, `160p30`, `audio_only`, plus the aliases `best` and `source` (= `chunked`).
 - **Metadata** `--metadata` prints stream info as JSON and exits without downloading: `streamer`, `video_id`, `title`, `stream_datetime`, `duration_seconds`, `duration`, `available_qualities`, `m3u8_url`. Combine with `--url` or `--m3u8`. Useful for scripting chunked downloads — grab `m3u8_url` once, then loop `--m3u8 <url> --start --end --quality`.
+- **Bulk download from CSV** `--csv <file>` recovers and downloads every VOD listed in a SullyGnome CSV export, without any interactive prompts. The streamer name is taken from the CSV filename. VODs whose ID already appears in a filename in the download directory are skipped, and a summary of downloaded / skipped / failed VODs is printed at the end.
+- **Bulk download from channel** `--channel <name>` works like `--csv`, but fetches the channel's recent streams automatically (no CSV export needed). A stream that is currently live is skipped.
+- **Bulk quality** With `--csv`/`--channel`, `--quality` defaults to `720p` and also accepts a resolution prefix (e.g. `1080p` tries `1080p60`, `1080p30`, `1080p20`). If the requested quality is not available, the originally found quality is downloaded instead.
 
 ## Notes
 

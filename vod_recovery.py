@@ -3487,6 +3487,7 @@ def bulk_vod_recovery():
     csv_file = parse_vod_csv_file(csv_file_path)
     print()
     all_m3u8_links = []
+    selected_quality = None  # NEU: merkt sich die einmal gewählte Auflösung
     loop = asyncio.new_event_loop()
     try:
         for timestamp, video_id in csv_file.items():
@@ -3494,6 +3495,21 @@ def bulk_vod_recovery():
             m3u8_link = loop.run_until_complete(get_vod_urls(streamer_name.lower(), video_id, timestamp))
 
             if m3u8_link is not None:
+                if selected_quality is None:
+                    # Beim ersten gefundenen VOD einmalig fragen
+                    quality_link = return_supported_qualities(m3u8_link)
+                    if quality_link:
+                        for res in RESOLUTIONS:
+                            if f"/{res}/" in quality_link:
+                                selected_quality = res
+                                break
+                        m3u8_link = quality_link
+                else:
+                    # Für alle weiteren VODs die gleiche Auflösung übernehmen
+                    found_quality = next((res for res in RESOLUTIONS if f"/{res}/" in m3u8_link), "chunked")
+                    candidate_link = m3u8_link.replace(f"/{found_quality}/", f"/{selected_quality}/")
+                    m3u8_link = candidate_link
+
                 processed_source = process_m3u8_configuration(m3u8_link) or m3u8_link
                 all_m3u8_links.append((video_id, processed_source))
             else:
@@ -3629,6 +3645,80 @@ def parse_clip_csv_file(file_path):
                 max_clip_offset = calculate_max_clip_offset(int(duration))
                 vod_info_dict.update({video_id: (modified_stream_date, max_clip_offset)})
     return vod_info_dict
+
+
+def find_quality_link(m3u8_link, quality):
+    # Sucht die gewünschte Auflösung (z.B. "720p" -> 720p60/720p30/720p20), sonst bleibt der gefundene Link
+    found_quality = next((res for res in RESOLUTIONS if f"/{res}/" in m3u8_link), None)
+    candidates = [res for res in RESOLUTIONS if res.startswith(quality)]
+    if found_quality:
+        for res in candidates:
+            candidate_link = m3u8_link.replace(f"/{found_quality}/", f"/{res}/")
+            try:
+                if requests.get(candidate_link, headers=return_user_agent(), timeout=15).status_code == 200:
+                    return candidate_link
+            except Exception:
+                pass
+    print(f"\033[93m  {quality} not available, using {found_quality or 'found'} quality\033[0m")
+    return m3u8_link
+
+
+def get_live_stream_id(streamer_name):
+    try:
+        response = requests.post("https://gql.twitch.tv/gql", headers={"Client-ID": "kimne78kx3ncx6brgo4mv6wki5h1ko"}, json={"query": "query($login: String!) { user(login: $login) { stream { id } } }", "variables": {"login": streamer_name}}, timeout=10)
+        stream = response.json()["data"]["user"]["stream"]
+        return stream["id"] if stream else None
+    except Exception:
+        return None
+
+
+def bulk_vod_recovery_channel_cli(streamer_name, quality):
+    # Holt die letzten Streams von vodvod (kein SullyGnome-CSV nötig) und lädt alle wiederherstellbaren VODs
+    streamer_name = streamer_name.lower()
+    streams = fetch_vod_vod_streams(streamer_name)
+    if not streams:
+        print(f"No streams found for {streamer_name}")
+        return
+    live_stream_id = get_live_stream_id(streamer_name)
+    vods = {}
+    for stream in streams:
+        if stream["stream_id"] == live_stream_id:
+            print(f"Skipping {stream['stream_id']}, stream is currently live")
+            continue
+        vods[stream["dt_utc"]] = (stream["stream_id"], stream["title"])
+    print(f"Found {len(vods)} streams for {streamer_name}")
+    bulk_vod_download(streamer_name, vods, quality)
+
+
+def bulk_vod_recovery_cli(csv_file_path, quality):
+    streamer_name = parse_streamer_from_csv_filename(csv_file_path)
+    vods = {timestamp: (video_id, None) for timestamp, video_id in parse_vod_csv_file(csv_file_path).items()}
+    bulk_vod_download(streamer_name, vods, quality)
+
+
+def bulk_vod_download(streamer_name, vods, quality):
+    existing_files = os.listdir(get_default_directory())
+    downloaded, skipped, failed = [], [], []
+    for timestamp, (video_id, title) in vods.items():
+        if any(f"[{video_id}]" in f for f in existing_files):
+            print(f"\nSkipping {video_id}, already downloaded")
+            skipped.append(video_id)
+            continue
+        print(f"\nRecovering Video: {video_id} ({timestamp})")
+        m3u8_link = run_vod_recovery(streamer_name.lower(), video_id, timestamp)
+        if m3u8_link is None:
+            print("No VODs found using the current domain list.")
+            failed.append(video_id)
+            continue
+        m3u8_link = find_quality_link(m3u8_link, quality)
+        m3u8_source = process_m3u8_configuration(m3u8_link) or m3u8_link
+        if handle_vod_url_normal(m3u8_source, title=title, stream_date=timestamp):
+            downloaded.append(video_id)
+        else:
+            failed.append(video_id)
+    print(f"\nDone: {len(downloaded)} downloaded, {len(skipped)} skipped, {len(failed)} not recoverable/failed")
+    if failed:
+        print("Failed: " + ", ".join(failed))
 
 
 def parse_vod_csv_file(file_path):
@@ -5882,14 +5972,16 @@ if __name__ == "__main__":
     parser.add_argument("--clip", dest="clip_url", help="Download Twitch clip by URL")
     parser.add_argument("--start", dest="start_time", help="Trim start time HH:MM:SS for VOD download")
     parser.add_argument("--end", dest="end_time", help="Trim end time HH:MM:SS for VOD download")
-    parser.add_argument("--quality", dest="quality", help="Video quality for VOD download (e.g. 1080p60, 720p60, audio_only, source, best)")
+    parser.add_argument("--quality", dest="quality", help="Video quality for VOD download (e.g. 1080p60, 720p60, audio_only, source, best). With --csv/--channel a prefix like 720p is allowed (default: 720p)")
     parser.add_argument("--metadata", dest="metadata", action="store_true", help="Print stream metadata as JSON and exit (use with --url or --m3u8)")
     parser.add_argument("--watch", dest="watch", action="store_true", help="Open the stream in VLC instead of downloading")
     parser.add_argument("--from-start", dest="from_start", action="store_true", help="Attempt to record live channel from the beginning")
+    parser.add_argument("--csv", dest="csv", help="Bulk recover and download all VODs from a SullyGnome CSV export")
+    parser.add_argument("--channel", dest="channel", help="Bulk recover and download all recent VODs of a channel (no CSV needed)")
 
     args = parser.parse_args()
 
-    if args.quality:
+    if args.quality and not (args.csv or args.channel):
         quality_arg = args.quality.strip().lower()
         if quality_arg not in RESOLUTIONS and quality_arg not in ("best", "source"):
             parser.error(f"--quality must be one of: {', '.join(RESOLUTIONS)}, best, source")
@@ -5904,10 +5996,14 @@ if __name__ == "__main__":
         print_metadata_cli(args)
         sys.exit(0)
 
-    if any([args.url, args.clip_url, getattr(args, "m3u8", None)]):
+    if any([args.url, args.clip_url, getattr(args, "m3u8", None), args.csv, args.channel]):
         try:
             CLI_MODE = True
-            if args.clip_url:
+            if args.channel:
+                bulk_vod_recovery_channel_cli(args.channel, (args.quality or "720p").strip().lower())
+            elif args.csv:
+                bulk_vod_recovery_cli(args.csv, (args.quality or "720p").strip().lower())
+            elif args.clip_url:
                 handle_twitch_clip(args.clip_url)
             elif getattr(args, "m3u8", None):
                 download_m3u8_cli(args)
